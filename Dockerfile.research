@@ -1,0 +1,7 @@
+FROM vllm/vllm-openai:v0.27.1
+
+RUN python3 -m pip install --no-cache-dir datasets==5.0.1
+
+WORKDIR /workspace
+ENTRYPOINT []
+CMD ["bash"]
