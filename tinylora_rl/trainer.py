@@ -5,15 +5,19 @@ from __future__ import annotations
 import json
 import time
 from collections.abc import Mapping
+from contextlib import nullcontext
+from copy import deepcopy
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Sequence
+from typing import Any, Sequence
 
 import torch
 from torch import Tensor, nn
 
 from .adapters import iter_tinylora_layers, save_tinylora, trainable_parameter_count
 from .objectives import GRPOBatch, compute_group_advantages, grpo_policy_loss, selected_completion_logprobs
+from .profiling import UnifiedMemoryProfiler
+from .prompts import gsm8k_messages
 from .rewards import gsm8k_reward
 from .rollout import Trajectory, VLLMRolloutBackend
 
@@ -38,6 +42,8 @@ class TrainConfig:
     loss_reduction: str = "sample_mean"
     seed: int = 42
     save_every: int = 0
+    prompt_style: str = "concise"
+    reward_mode: str = "flexible"
 
 
 @dataclass
@@ -104,6 +110,10 @@ class TinyLoRAGRPOTrainer:
         rollout: VLLMRolloutBackend,
         config: TrainConfig,
         output_dir: str | Path,
+        memory_profiler: UnifiedMemoryProfiler | None = None,
+        run_provenance: Mapping[str, Any] | None = None,
+        dataset_split: str = "train",
+        dataset_revision: str | None = None,
     ) -> None:
         self.model = model
         self.tokenizer = tokenizer
@@ -111,6 +121,16 @@ class TinyLoRAGRPOTrainer:
         self.config = config
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.memory_profiler = memory_profiler or UnifiedMemoryProfiler(
+            self.output_dir / "memory_profile.json",
+            enabled=False,
+        )
+        # Copy this now so callers cannot mutate the recorded execution setup
+        # after trainer construction.  The entrypoint supplies only JSON-safe
+        # values; json.dumps below remains the final validation boundary.
+        self.run_provenance = deepcopy(dict(run_provenance or {}))
+        self.dataset_split = dataset_split
+        self.dataset_revision = dataset_revision
         parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
         if not parameters:
             raise ValueError("model has no trainable parameters")
@@ -122,18 +142,16 @@ class TinyLoRAGRPOTrainer:
         self.generator = torch.Generator(device="cpu").manual_seed(config.seed)
         self.metrics_path = self.output_dir / "metrics.jsonl"
         self.trajectories_path = self.output_dir / "trajectories.jsonl"
+        self.memory_profiler.record_training_state(
+            "optimizer_initialized",
+            self.model,
+            self.optimizer,
+        )
 
     def _prompt_ids(self, questions: Sequence[str]) -> list[list[int]]:
-        instruction = (
-            "Solve with a concise calculation. End with a final line exactly in the "
-            "form: #### <number>."
-        )
         encoded_prompts = [
             self.tokenizer.apply_chat_template(
-                [
-                    {"role": "system", "content": instruction},
-                    {"role": "user", "content": question},
-                ],
+                gsm8k_messages(question, self.config.prompt_style),
                 tokenize=True,
                 add_generation_prompt=True,
             )
@@ -166,24 +184,37 @@ class TinyLoRAGRPOTrainer:
                     completion_ids=completion_ids,
                     rollout_logprobs=rollout_logprobs,
                     completion=completion,
-                    reward=gsm8k_reward(completion, answers[group_id]),
+                    reward=gsm8k_reward(
+                        completion,
+                        answers[group_id],
+                        mode=self.config.reward_mode,
+                    ),
                     group_id=group_id,
                 )
             )
         return trajectories
 
-    def _update(self, trajectories: Sequence[Trajectory]) -> dict[str, float]:
+    def _update(self, trajectories: Sequence[Trajectory], step: int) -> dict[str, float]:
         device = next(self.model.parameters()).device
-        tensor_batch = collate_trajectories(
-            trajectories,
-            pad_token_id=self.tokenizer.pad_token_id,
-            device=device,
-        )
-        rewards = torch.tensor([item.reward for item in trajectories], dtype=torch.float32, device=device)
-        group_ids = torch.tensor([item.group_id for item in trajectories], dtype=torch.long, device=device)
-        advantages = compute_group_advantages(rewards, group_ids)
-        self.model.eval()
-        old_logprobs = batched_policy_logprobs(self.model, tensor_batch, self.config.micro_batch_size)
+        phase_prefix = f"step_{step:06d}"
+        with self.memory_profiler.phase(f"{phase_prefix}.collate_and_advantages"):
+            tensor_batch = collate_trajectories(
+                trajectories,
+                pad_token_id=self.tokenizer.pad_token_id,
+                device=device,
+            )
+            rewards = torch.tensor(
+                [item.reward for item in trajectories], dtype=torch.float32, device=device
+            )
+            group_ids = torch.tensor(
+                [item.group_id for item in trajectories], dtype=torch.long, device=device
+            )
+            advantages = compute_group_advantages(rewards, group_ids)
+        with self.memory_profiler.phase(f"{phase_prefix}.old_policy_logprobs"):
+            self.model.eval()
+            old_logprobs = batched_policy_logprobs(
+                self.model, tensor_batch, self.config.micro_batch_size
+            )
         # Hugging Face activates gradient checkpointing only in training mode.
         # The frozen base has no dropout in the target models, while TinyLoRA's
         # bank still receives gradients through non-reentrant checkpoints.
@@ -200,51 +231,76 @@ class TinyLoRAGRPOTrainer:
         last_loss = torch.tensor(0.0, device=device)
         grad_norm = torch.tensor(0.0, device=device)
         batch_size = len(trajectories)
-        for _ in range(self.config.ppo_epochs):
-            self.optimizer.zero_grad(set_to_none=True)
-            permutation = torch.randperm(batch_size, generator=self.generator).to(device)
-            accumulated_loss = torch.tensor(0.0, device=device)
-            accumulated_metrics: dict[str, Tensor] = {}
-            for start in range(0, batch_size, self.config.micro_batch_size):
-                indices = permutation[start : start + self.config.micro_batch_size]
-                micro = tensor_batch.select(indices)
-                current = policy_logprobs(self.model, micro)
-                selected_batch = GRPOBatch(
-                    rewards=rewards[indices],
-                    group_ids=group_ids[indices],
-                    old_logprobs=grpo_batch.old_logprobs[indices],
-                    rollout_logprobs=grpo_batch.rollout_logprobs[indices],
-                    response_mask=grpo_batch.response_mask[indices],
-                )
-                loss, last_metrics = grpo_policy_loss(
-                    current,
-                    advantages[indices],
-                    selected_batch,
-                    clip_epsilon=self.config.clip_epsilon,
-                    tis_mode=self.config.tis_mode,
-                    tis_minimum=self.config.tis_minimum,
-                    tis_maximum=self.config.tis_maximum,
-                    reduction=self.config.loss_reduction,
-                )
-                if self.config.loss_reduction == "sample_mean":
-                    micro_weight = len(indices) / batch_size
-                else:
-                    micro_weight = float(micro.response_mask.sum().item()) / max(
-                        float(tensor_batch.response_mask.sum().item()), 1.0
+        for epoch in range(self.config.ppo_epochs):
+            epoch_prefix = f"{phase_prefix}.ppo_epoch_{epoch + 1:02d}"
+            with self.memory_profiler.phase(f"{epoch_prefix}.forward_backward"):
+                self.optimizer.zero_grad(set_to_none=True)
+                permutation = torch.randperm(batch_size, generator=self.generator).to(device)
+                accumulated_loss = torch.tensor(0.0, device=device)
+                accumulated_metrics: dict[str, Tensor] = {}
+                for start in range(0, batch_size, self.config.micro_batch_size):
+                    indices = permutation[start : start + self.config.micro_batch_size]
+                    micro = tensor_batch.select(indices)
+                    should_track_saved = step == 1 and epoch == 0 and start == 0
+                    saved_context = (
+                        self.memory_profiler.track_saved_tensors(
+                            f"{epoch_prefix}.representative_microbatch",
+                            self.model,
+                        )
+                        if should_track_saved
+                        else nullcontext()
                     )
-                (loss * micro_weight).backward()
-                accumulated_loss += loss.detach() * micro_weight
-                for name, value in last_metrics.items():
-                    accumulated_metrics[name] = accumulated_metrics.get(
-                        name, torch.tensor(0.0, device=device)
-                    ) + value * micro_weight
-            last_loss = accumulated_loss
-            last_metrics = accumulated_metrics
-            grad_norm = torch.nn.utils.clip_grad_norm_(
-                [parameter for parameter in self.model.parameters() if parameter.requires_grad],
-                self.config.max_grad_norm,
-            )
-            self.optimizer.step()
+                    with saved_context:
+                        current = policy_logprobs(self.model, micro)
+                        selected_batch = GRPOBatch(
+                            rewards=rewards[indices],
+                            group_ids=group_ids[indices],
+                            old_logprobs=grpo_batch.old_logprobs[indices],
+                            rollout_logprobs=grpo_batch.rollout_logprobs[indices],
+                            response_mask=grpo_batch.response_mask[indices],
+                        )
+                        loss, last_metrics = grpo_policy_loss(
+                            current,
+                            advantages[indices],
+                            selected_batch,
+                            clip_epsilon=self.config.clip_epsilon,
+                            tis_mode=self.config.tis_mode,
+                            tis_minimum=self.config.tis_minimum,
+                            tis_maximum=self.config.tis_maximum,
+                            reduction=self.config.loss_reduction,
+                        )
+                        if self.config.loss_reduction == "sample_mean":
+                            micro_weight = len(indices) / batch_size
+                        else:
+                            micro_weight = float(micro.response_mask.sum().item()) / max(
+                                float(tensor_batch.response_mask.sum().item()), 1.0
+                            )
+                        (loss * micro_weight).backward()
+                    accumulated_loss += loss.detach() * micro_weight
+                    for name, value in last_metrics.items():
+                        accumulated_metrics[name] = accumulated_metrics.get(
+                            name, torch.tensor(0.0, device=device)
+                        ) + value * micro_weight
+                last_loss = accumulated_loss
+                last_metrics = accumulated_metrics
+            if step == 1 and epoch == 0:
+                self.memory_profiler.record_training_state(
+                    f"{epoch_prefix}.after_backward",
+                    self.model,
+                    self.optimizer,
+                )
+            with self.memory_profiler.phase(f"{epoch_prefix}.optimizer_step"):
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    [parameter for parameter in self.model.parameters() if parameter.requires_grad],
+                    self.config.max_grad_norm,
+                )
+                self.optimizer.step()
+            if step == 1 and epoch == 0:
+                self.memory_profiler.record_training_state(
+                    f"{epoch_prefix}.after_optimizer",
+                    self.model,
+                    self.optimizer,
+                )
 
         reward_groups = []
         for group_id in torch.unique(group_ids):
@@ -267,19 +323,48 @@ class TinyLoRAGRPOTrainer:
         }
 
     def train(self, dataset: object) -> None:
+        reward_implementation = {
+            "strict": "verl_gsm8k_strict_last_300_chars_v1",
+            "flexible": "normalized_last_number_v1",
+        }.get(self.config.reward_mode, "unknown")
         manifest = {
+            "schema_version": 3,
             "trainer": "from-scratch PyTorch GRPO",
             "base_model": getattr(getattr(self.model, "config", None), "_name_or_path", None),
+            "base_model_revision": getattr(
+                getattr(self.model, "config", None), "_commit_hash", None
+            ),
+            "dataset": {
+                "id": "openai/gsm8k",
+                "config": "main",
+                "split": self.dataset_split,
+                "revision": self.dataset_revision,
+                "selected_rows": len(dataset),
+                "fingerprint": getattr(dataset, "_fingerprint", None),
+            },
             "adapter_config": asdict(self.model.tinylora_config),
             "train_config": asdict(self.config),
+            "prompt": {
+                "style": self.config.prompt_style,
+            },
+            "reward": {
+                "mode": self.config.reward_mode,
+                "implementation": reward_implementation,
+            },
             "target_layers": sum(1 for _ in iter_tinylora_layers(self.model)),
             "trainable_parameters": trainable_parameter_count(self.model),
         }
+        conflicts = manifest.keys() & self.run_provenance.keys()
+        if conflicts:
+            names = ", ".join(sorted(conflicts))
+            raise ValueError(f"run provenance cannot replace manifest fields: {names}")
+        manifest.update(self.run_provenance)
         (self.output_dir / "run_manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
         order = torch.randperm(len(dataset), generator=self.generator).tolist()
         cursor = 0
         if getattr(self.rollout, "sync_before_first_rollout", False):
-            synced = self.rollout.sync_tinylora(self.model)
+            with self.memory_profiler.phase("initial_adapter_sync"):
+                synced = self.rollout.sync_tinylora(self.model)
             print(json.dumps({"initial_adapter_sync": synced}), flush=True)
         for step in range(1, self.config.steps + 1):
             if cursor + self.config.prompts_per_step > len(order):
@@ -289,7 +374,10 @@ class TinyLoRAGRPOTrainer:
             cursor += self.config.prompts_per_step
             rows = dataset.select(indices)
             started = time.perf_counter()
-            trajectories = self._sample_trajectories(rows["question"], rows["answer"], step)
+            with self.memory_profiler.phase(f"step_{step:06d}.rollout_generate"):
+                trajectories = self._sample_trajectories(
+                    rows["question"], rows["answer"], step
+                )
             with self.trajectories_path.open("a") as handle:
                 for trajectory in trajectories:
                     handle.write(
@@ -300,14 +388,17 @@ class TinyLoRAGRPOTrainer:
                                 "question": rows["question"][trajectory.group_id],
                                 "gold_answer": rows["answer"][trajectory.group_id],
                                 "completion": trajectory.completion,
+                                "completion_ids": trajectory.completion_ids,
+                                "rollout_logprobs": trajectory.rollout_logprobs,
                                 "completion_tokens": len(trajectory.completion_ids),
                                 "reward": trajectory.reward,
                             }
                         )
                         + "\n"
                     )
-            metrics = self._update(trajectories)
-            synced = self.rollout.sync_tinylora(self.model)
+            metrics = self._update(trajectories, step)
+            with self.memory_profiler.phase(f"step_{step:06d}.updated_adapter_sync"):
+                synced = self.rollout.sync_tinylora(self.model)
             metrics.update(
                 {
                     "step": step,
@@ -319,5 +410,7 @@ class TinyLoRAGRPOTrainer:
                 handle.write(json.dumps(metrics) + "\n")
             print(json.dumps(metrics), flush=True)
             if self.config.save_every and step % self.config.save_every == 0:
-                save_tinylora(self.model, self.output_dir / f"checkpoint-{step}")
-        save_tinylora(self.model, self.output_dir / "final_adapter")
+                with self.memory_profiler.phase(f"step_{step:06d}.checkpoint_save"):
+                    save_tinylora(self.model, self.output_dir / f"checkpoint-{step}")
+        with self.memory_profiler.phase("final_adapter_save"):
+            save_tinylora(self.model, self.output_dir / "final_adapter")

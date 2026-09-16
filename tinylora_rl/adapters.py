@@ -44,6 +44,7 @@ class TinyLoRAConfig:
     # fixed number of modules per group (for example, 24 projections / 13 v's).
     num_groups: int | None = None
     target_modules: tuple[str, ...] = DEFAULT_TARGET_MODULES
+    target_layer_indices: tuple[int, ...] | None = None
     grouping: Literal["tiled", "structured"] = "tiled"
     projection_seed: int = 42
     projection_std: float | None = None
@@ -62,6 +63,13 @@ class TinyLoRAConfig:
             raise ValueError("num_groups must be positive when provided")
         if not self.target_modules:
             raise ValueError("target_modules cannot be empty")
+        if self.target_layer_indices is not None:
+            if not self.target_layer_indices:
+                raise ValueError("target_layer_indices cannot be empty when provided")
+            if any(index < 0 for index in self.target_layer_indices):
+                raise ValueError("target_layer_indices must be non-negative")
+            if len(set(self.target_layer_indices)) != len(self.target_layer_indices):
+                raise ValueError("target_layer_indices cannot contain duplicates")
 
 
 class TinyLoRAParameterBank(nn.Module):
@@ -151,10 +159,27 @@ def _get_submodule_parent(model: nn.Module, name: str) -> tuple[nn.Module, str]:
 
 
 def _target_linears(model: nn.Module, config: TinyLoRAConfig) -> list[tuple[str, nn.Linear]]:
+    selected_layers = (
+        set(config.target_layer_indices)
+        if config.target_layer_indices is not None
+        else None
+    )
+
+    def layer_is_selected(name: str) -> bool:
+        if selected_layers is None:
+            return True
+        fields = name.split(".")
+        for position, field in enumerate(fields[:-1]):
+            if field == "layers" and fields[position + 1].isdigit():
+                return int(fields[position + 1]) in selected_layers
+        return False
+
     targets = [
         (name, module)
         for name, module in model.named_modules()
-        if isinstance(module, nn.Linear) and name.rsplit(".", 1)[-1] in config.target_modules
+        if isinstance(module, nn.Linear)
+        and name.rsplit(".", 1)[-1] in config.target_modules
+        and layer_is_selected(name)
     ]
     if config.grouping == "structured":
         target_order = {name: index for index, name in enumerate(config.target_modules)}
@@ -214,7 +239,6 @@ def apply_tinylora(
     setattr(model, "tinylora_config", config)
 
     cache_path = Path(factor_cache) if factor_cache is not None else None
-    write_cache = cache_path is not None and not cache_path.exists()
     cached = load_file(str(cache_path), device=str(first_weight.device)) if cache_path and cache_path.exists() else {}
     new_cache: dict[str, Tensor] = {}
     projection_std = config.projection_std or (1.0 / math.sqrt(config.rank))
@@ -238,7 +262,7 @@ def apply_tinylora(
                 niter=config.svd_niter,
                 seed=config.projection_seed + index,
             )
-        if write_cache:
+        if cache_path is not None and not cached_shapes_match:
             new_cache[left_key] = left.detach().cpu().contiguous()
             new_cache[right_key] = right.detach().cpu().contiguous()
 
@@ -272,9 +296,14 @@ def apply_tinylora(
         parent, child_name = _get_submodule_parent(model, name)
         setattr(parent, child_name, wrapper)
 
-    if write_cache and cache_path is not None:
+    if new_cache and cache_path is not None:
         cache_path.parent.mkdir(parents=True, exist_ok=True)
-        save_file(new_cache, str(cache_path))
+        combined_cache = {
+            name: tensor.detach().cpu().contiguous()
+            for name, tensor in cached.items()
+        }
+        combined_cache.update(new_cache)
+        save_file(combined_cache, str(cache_path))
     return model
 
 
@@ -377,6 +406,8 @@ def load_tinylora(model: nn.Module, adapter_dir: str | Path) -> nn.Module:
     metadata = json.loads((adapter_path / "adapter_config.json").read_text())
     raw_config = dict(metadata["config"])
     raw_config["target_modules"] = tuple(raw_config["target_modules"])
+    if raw_config.get("target_layer_indices") is not None:
+        raw_config["target_layer_indices"] = tuple(raw_config["target_layer_indices"])
     config = TinyLoRAConfig(**raw_config)
     modules = metadata["modules"]
     if not modules:

@@ -13,6 +13,8 @@ venv/
 # Generated training artifacts and cached factors/models
 cache/
 outputs/
+adapter_registry/*
+!adapter_registry/README.md
 wandb/
 *.log
 

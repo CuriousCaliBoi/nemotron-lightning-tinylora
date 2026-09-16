@@ -1,6 +1,9 @@
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 from safetensors.torch import load_file
@@ -35,7 +38,42 @@ class ToyModel(nn.Module):
         return self.block["down_proj"](self.block["v_proj"](self.q_proj(x)))
 
 
+class LayeredToyModel(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.layers = nn.ModuleList(
+            [nn.ModuleDict({"q_proj": nn.Linear(4, 4, bias=False)}) for _ in range(3)]
+        )
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        for layer in self.layers:
+            inputs = layer["q_proj"](inputs)
+        return inputs
+
+
 class TinyLoRATest(unittest.TestCase):
+    def test_vllm_lora_targets_are_forwarded_to_engine(self) -> None:
+        captured = {}
+
+        class FakeLLM:
+            def __init__(self, **kwargs: object) -> None:
+                captured.update(kwargs)
+
+        with patch.dict(sys.modules, {"vllm": SimpleNamespace(LLM=FakeLLM)}):
+            VLLMRolloutBackend(
+                "test/model",
+                gpu_memory_utilization=0.2,
+                max_model_len=32,
+                seed=7,
+                enable_lora=True,
+                max_lora_rank=8,
+                lora_target_modules=("q_proj", "k_proj", "v_proj", "o_proj"),
+            )
+        self.assertEqual(
+            captured["lora_target_modules"],
+            ["q_proj", "k_proj", "v_proj", "o_proj"],
+        )
+
     def test_vllm_packed_projection_name_mapping(self) -> None:
         map_name = VLLMRolloutBackend._vllm_destination_name
         self.assertEqual(
@@ -88,6 +126,44 @@ class TinyLoRATest(unittest.TestCase):
         self.assertEqual(model.tinylora_bank.v.shape, (2, 1))
         self.assertEqual([layer.group_id for layer in layers], [0, 0, 1])
         self.assertEqual(trainable_parameter_count(model), 2)
+
+    def test_layer_index_filter_restricts_backward_targets(self) -> None:
+        model = LayeredToyModel()
+        config = TinyLoRAConfig(
+            rank=2,
+            projection_dim=1,
+            target_modules=("q_proj",),
+            target_layer_indices=(1, 2),
+            num_groups=2,
+        )
+        apply_tinylora(model, config)
+        layers = [layer.original_name for _, layer in iter_tinylora_layers(model)]
+        self.assertEqual(layers, ["layers.1.q_proj", "layers.2.q_proj"])
+        self.assertIsInstance(model.layers[0]["q_proj"], nn.Linear)
+        self.assertEqual(trainable_parameter_count(model), 2)
+
+    def test_factor_cache_is_extended_for_new_layer_selection(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            cache = Path(directory) / "factors.safetensors"
+            partial = LayeredToyModel()
+            apply_tinylora(
+                partial,
+                TinyLoRAConfig(
+                    rank=2,
+                    target_modules=("q_proj",),
+                    target_layer_indices=(2,),
+                ),
+                factor_cache=cache,
+            )
+            self.assertEqual(len(load_file(str(cache))), 2)
+
+            complete = LayeredToyModel()
+            apply_tinylora(
+                complete,
+                TinyLoRAConfig(rank=2, target_modules=("q_proj",)),
+                factor_cache=cache,
+            )
+            self.assertEqual(len(load_file(str(cache))), 6)
 
     def test_factorized_forward_equals_materialized_weight(self) -> None:
         with torch.no_grad():

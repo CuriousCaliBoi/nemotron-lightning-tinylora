@@ -8,6 +8,7 @@ set -euo pipefail
 
 SERVER_CONTAINER="${SERVER_CONTAINER:-nemotron35_lightning_vllm}"
 SERVER_WAS_RUNNING=0
+TINYLORA_RANK_VALUE="${TINYLORA_RANK:-2}"
 
 if docker inspect -f '{{.State.Running}}' "$SERVER_CONTAINER" 2>/dev/null | grep -qx true; then
   SERVER_WAS_RUNNING=1
@@ -33,7 +34,8 @@ MODEL="${MODEL:-nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16}" \
 ROLLOUT_MODEL="${ROLLOUT_MODEL:-nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4}" \
 ROLLOUT_SYNC="${ROLLOUT_SYNC:-lora}" \
 TARGET_MODULES="${TARGET_MODULES:-q_proj,k_proj,v_proj,o_proj}" \
-TINYLORA_RANK="${TINYLORA_RANK:-2}" \
+TARGET_LAYER_INDICES="${TARGET_LAYER_INDICES:-}" \
+TINYLORA_RANK="$TINYLORA_RANK_VALUE" \
 PROJECTION_DIM="${PROJECTION_DIM:-1}" \
 NUM_GROUPS="${NUM_GROUPS:-13}" \
 PARAMETER_DTYPE="${PARAMETER_DTYPE:-float32}" \
@@ -51,6 +53,6 @@ VLLM_MAMBA_BACKEND="${VLLM_MAMBA_BACKEND:-flashinfer}" \
 VLLM_MAMBA_CACHE_MODE="${VLLM_MAMBA_CACHE_MODE:-align}" \
 VLLM_KV_CACHE_DTYPE="${VLLM_KV_CACHE_DTYPE:-fp8}" \
 OUTPUT_DIR="${OUTPUT_DIR:-/workspace/outputs/nemotron35-nvfp4-tinylora-smoke}" \
-FACTOR_CACHE="${FACTOR_CACHE:-/workspace/cache/nemotron35-lightning-attention-r2-svd.safetensors}" \
+FACTOR_CACHE="${FACTOR_CACHE:-/workspace/cache/nemotron35-lightning-attention-r${TINYLORA_RANK_VALUE}-svd.safetensors}" \
 PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}" \
 ./run_tinylora_rl.sh

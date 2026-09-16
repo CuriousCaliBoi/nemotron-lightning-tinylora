@@ -41,6 +41,7 @@ class VLLMRolloutBackend:
         trust_remote_code: bool = False,
         enable_lora: bool = False,
         max_lora_rank: int = 8,
+        lora_target_modules: Sequence[str] | None = None,
         engine_kwargs: dict[str, object] | None = None,
     ) -> None:
         # Import lazily so objective and adapter unit tests do not initialize CUDA.
@@ -58,6 +59,8 @@ class VLLMRolloutBackend:
                 "max_lora_rank": max_lora_rank,
                 "lora_dtype": "bfloat16",
             }
+            if lora_target_modules is not None:
+                lora_args["lora_target_modules"] = list(lora_target_modules)
         self.llm = LLM(
             model=model_name,
             tensor_parallel_size=1,
@@ -75,6 +78,10 @@ class VLLMRolloutBackend:
 
     def _active_lora_request(self) -> object | None:
         return None
+
+    def model_for_profiling(self) -> nn.Module:
+        """Expose the in-process runner model for read-only tensor accounting."""
+        return self.llm.llm_engine.model_executor.driver_worker.model_runner.model
 
     @staticmethod
     def _chosen_logprob(token_id: int, candidates: dict[int, object]) -> float:
@@ -126,7 +133,7 @@ class VLLMRolloutBackend:
     @torch.no_grad()
     def sync_tinylora(self, model: nn.Module) -> int:
         """Load materialized adapted weights into the colocated vLLM model."""
-        runner_model = self.llm.llm_engine.model_executor.driver_worker.model_runner.model
+        runner_model = self.model_for_profiling()
         layers = list(iter_tinylora_layers(model))
 
         # Pass the original Hugging Face names. vLLM's model loader maps Q/K/V
@@ -185,6 +192,7 @@ class VLLMLoRARolloutBackend(VLLMRolloutBackend):
         max_model_len: int,
         seed: int,
         max_lora_rank: int = 8,
+        lora_target_modules: Sequence[str] | None = None,
         trust_remote_code: bool = False,
         engine_kwargs: dict[str, object] | None = None,
     ) -> None:
@@ -196,6 +204,7 @@ class VLLMLoRARolloutBackend(VLLMRolloutBackend):
             trust_remote_code=trust_remote_code,
             enable_lora=True,
             max_lora_rank=max_lora_rank,
+            lora_target_modules=lora_target_modules,
             engine_kwargs=engine_kwargs,
         )
         self.model_name = model_name
